@@ -37,7 +37,7 @@ Laravelはデフォルトでは直接接続してきたピア（このリポジ�
 
 ## 検証コマンドと期待出力
 
-`ALB=$(terraform output -raw alb_url)` として、すべて `curl -k`（自己署名のため）。
+`ALB=$(terraform output -raw alb_url)` として、すべて `curl -k`（自己署名のため）。EC2/ALBを構築する前にローカルで挙動だけ確認したい場合は、`php artisan whoami:check` / `php artisan env:set` を使うと `php artisan serve` やcurlを使わずに同じ確認ができる（README「artisanコマンドでの確認」参照）。
 
 ### TrustProxies OFF（`.env`: `TRUST_PROXIES=none`）
 ```bash

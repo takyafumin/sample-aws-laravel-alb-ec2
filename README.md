@@ -25,6 +25,35 @@ php artisan serve
 
 `http://127.0.0.1:8000/whoami` にアクセスして動作確認できる（ローカルではALB由来のヘッダが無いため `raw.*` はほぼ空になる）。
 
+### artisanコマンドでの確認（curl不要）
+
+`php artisan serve` を起動しなくても、実際のHTTPカーネル（ミドルウェアスタック一式）を通して `/whoami` を叩けるコマンドを同梱している。`.env` の書き換えも `env:set` で行える。
+
+```bash
+# TRUST_PROXIES=none のまま、ALBヘッダを模してリクエスト
+php artisan whoami:check --for=203.0.113.9 --proto=https
+# => resolved.ip は自分の接続元IPのまま、is_secure=false（ヘッダは無視される）
+
+# TRUST_PROXIES=all に切替
+php artisan env:set TRUST_PROXIES all
+php artisan whoami:check --for=203.0.113.9 --proto=https
+# => resolved.ip=203.0.113.9, is_secure=true, scheme=https に反転
+
+# POST の確認（CSRFで419にならないこと）
+php artisan whoami:check --method=POST
+
+# TRUST_HOSTS の確認
+php artisan env:set TRUST_HOSTS '^.*\.elb\.amazonaws\.com$'
+php artisan whoami:check --host=my-alb.ap-northeast-1.elb.amazonaws.com   # => 200
+php artisan whoami:check --host=evil.example                              # => 400
+
+# 既定値に戻す
+php artisan env:set TRUST_PROXIES none
+php artisan env:set TRUST_HOSTS
+```
+
+`storage/logs/laravel.log` に `LogConnection` ミドルウェアの出力（`/whoami` と同じ項目）が記録されるので、`tail -f storage/logs/laravel.log` と併用するとよい。
+
 ## 3. Stateバケット作成
 
 ```bash
