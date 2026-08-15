@@ -1,6 +1,6 @@
 resource "aws_security_group" "alb" {
   name        = "${var.project_name}-alb-sg"
-  description = "ALB: HTTPS(443) と redirect用HTTP(80) を受ける"
+  description = "ALB: receives HTTPS(443) and redirect HTTP(80)"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -34,7 +34,7 @@ resource "aws_security_group" "alb" {
 # EC2 は ALB からの HTTP:80 のみ許可。SSM 経由でしかアクセスしないため 22 は開けない。
 resource "aws_security_group" "ec2" {
   name        = "${var.project_name}-ec2-sg"
-  description = "EC2: ALBからのHTTP:80のみ許可、SSHは開けない"
+  description = "EC2: allows HTTP:80 from ALB only, no SSH"
   vpc_id      = aws_vpc.main.id
 
   ingress {
