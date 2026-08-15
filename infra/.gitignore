@@ -1,0 +1,6 @@
+.terraform/
+backend.hcl
+*.tfvars
+*.tfvars.json
+crash.log
+crash.*.log

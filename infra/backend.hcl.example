@@ -1,0 +1,3 @@
+bucket = "REPLACE-ME-tf-state-bucket"
+key    = "trust-verify/terraform.tfstate"
+region = "ap-northeast-1"

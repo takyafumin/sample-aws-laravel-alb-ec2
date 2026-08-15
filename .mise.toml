@@ -1,0 +1,4 @@
+[tools]
+php = "8.4"
+node = "24"
+composer = "latest"
