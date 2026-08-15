@@ -16,6 +16,13 @@ EC2起動時に [`infra/user_data.sh.tpl`](../infra/user_data.sh.tpl) が一度�
 
 > ALBのターゲットグループヘルスチェックは `/up`。Apacheが起動し `/up` が200を返すまでALBは対象インスタンスを `unhealthy` と表示する。プロビジョニング完了まで数分かかる。
 
+### 実際にハマった点（教訓）
+
+このリポジトリを実際に構築・デプロイする過程で遭遇した、他のuser_dataスクリプトを書くときにも起きがちな問題を記録しておく。
+
+- **`composer` が `HOME`/`COMPOSER_HOME` 未設定で失敗する**: `user_data` はrootが非対話シェルで実行するため、通常のログインシェルと違い `$HOME` が設定されていないことがある。Composerは内部でキャッシュ・設定の保存先として `$HOME` を必要とするため、未設定だと `The HOME or COMPOSER_HOME environment variable must be set` で即座に失敗する。`set -euo pipefail` を使っている場合、これでスクリプト全体が止まり、それ以降の全ステップ（`git clone`以降）が無言でスキップされる。**教訓**: cron・user-data・systemdサービスなど「誰かがログインして動かすわけではない」実行環境では `$HOME` や `$PATH` が期待通りとは限らない。CLIツールを使う前提のスクリプトでは明示的に `export HOME=/root` のように設定しておくと安全。
+- **`aws_security_group` の `description` に日本語を使うとAPIエラーになる**: AWSのEC2 API（`CreateSecurityGroup`）の `GroupDescription` はASCII文字のみ受け付ける。Terraformコード中のコメント（`#`）は自由に日本語で書けるが、実際にAWS APIへ送られる `description` 引数の値は英語（ASCII）にする必要がある。
+
 ## 更新デプロイ（SSM経由）
 
 コード更新は [`scripts/deploy.sh`](../scripts/deploy.sh) をEC2上で実行して行う（`git pull` ベース。Deployer等の外部ツールは使わない）。

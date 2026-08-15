@@ -2,6 +2,15 @@
 
 ALB + 単一EC2上でLaravel 13を動かし、**TrustProxies / TrustHosts の挙動差分を実際に観測できる**検証環境。`.env` のトグルを書き換えるだけで、ALBが付与するプロキシヘッダ（`X-Forwarded-For` / `X-Forwarded-Proto` / `Host` など）をLaravelが信頼する・しないの違いを `GET/POST /whoami` のレスポンスとログで確認できる。
 
+### このリポジトリで学べること
+
+- **HTTPヘッダは偽装できる**という前提を、実際にヘッダを偽装してAPIの応答が変わる様子で体感できる（[docs/trust-proxy.md](docs/trust-proxy.md)）
+- ロードバランサ配下のアプリで「信頼するプロキシ／Hostを明示的に絞る」ことがなぜ必要か（IPアドレス偽装・Hostヘッダインジェクションという具体的な攻撃と結びつけて理解する）
+- 自己署名証明書・`curl -k`・SSH閉塞＋SSM運用など、検証環境ならではの割り切りと、本番ではどうすべきかの違い（[docs/architecture.md](docs/architecture.md)）
+- 最小権限IAM設計の実例（`PowerUserAccess` がなぜIAM操作を許可しないのか、実際にハマった過程込みで [README「IAM権限について」](#iam権限について)）
+
+セキュリティの前提知識がなくても読めるように書いてあるので、各docsの「なぜ危険か」「なぜこの設計か」という補足から読むのがおすすめ。
+
 高可用・オートスケール・独自ドメイン・外部デプロイツール・永続DBは非ゴール（詳細は [GENERATION_SPEC.md](GENERATION_SPEC.md) 参照）。
 
 ## 1. 前提ツール
@@ -10,6 +19,16 @@ ALB + 単一EC2上でLaravel 13を動かし、**TrustProxies / TrustHosts の挙
 - Terraform >= 1.11（S3ネイティブロック `use_lockfile` を使うため）
 - [mise](https://mise.jdx.dev/)
 - git
+
+### IAM権限について
+
+`terraform apply` を実行する人（＝あなた自身のIAM Identity）には、VPC/ALB/EC2に加えて **IAMロール・インスタンスプロファイルを作成できる権限**が必要になる（EC2にSSM用のロールをアタッチするため。[infra/iam.tf](../infra/iam.tf)）。
+
+**`PowerUserAccess` だけでは不足する。** これはAWSの意図的な設計で、`PowerUserAccess` ポリシーは `NotAction: ["iam:*", ...]` という形でIAM操作全般を明示的に除外している（「PowerUser経由で自分にIAMロールを作らせて権限昇格する」ことを防ぐため）。IAM Identity Center（SSO）を使っている場合、対象のPermission Setに以下のようなIAM操作を許可する追加ポリシーが必要になる:
+
+`iam:CreateRole` / `iam:GetRole` / `iam:DeleteRole` / `iam:TagRole` / `iam:AttachRolePolicy` / `iam:DetachRolePolicy` / `iam:CreateInstanceProfile` / `iam:DeleteInstanceProfile` / `iam:AddRoleToInstanceProfile` / `iam:RemoveRoleFromInstanceProfile` / `iam:PassRole`
+
+（`AmazonEC2FullAccess`や`IAMFullAccess`のような広いAWS管理ポリシーを追加でアタッチしても解決する。個人検証用アカウントであれば手軽さを優先してこちらでもよい。）
 
 ## 2. ローカルセットアップ
 
@@ -39,7 +58,7 @@ php artisan env:set TRUST_PROXIES all
 php artisan whoami:check --for=203.0.113.9 --proto=https
 # => resolved.ip=203.0.113.9, is_secure=true, scheme=https に反転
 
-# POST の確認（CSRFで419にならないこと）
+# POST の確認（CSRFで419にならないこと。理由は下記）
 php artisan whoami:check --method=POST
 
 # TRUST_HOSTS の確認
@@ -53,6 +72,8 @@ php artisan env:set TRUST_HOSTS
 ```
 
 `storage/logs/laravel.log` に `LogConnection` ミドルウェアの出力（`/whoami` と同じ項目）が記録されるので、`tail -f storage/logs/laravel.log` と併用するとよい。
+
+> **なぜ `/whoami` はCSRF保護を除外しているか**: CSRF（クロスサイトリクエストフォージェリ）保護は、ログイン中のユーザーが気づかないうちに別サイト経由で「意図しない状態変更（送金・退会・投稿など）」をさせられるのを防ぐ仕組み。`/whoami` は診断用の読み取り専用エンドポイントで、DBの状態を変えたりユーザーに不利益を与えたりする副作用が一切ないため、確認のしやすさを優先して除外している。**状態を変更する本物のPOSTエンドポイントに対して同じことをしてはいけない**（`bootstrap/app.php` の `validateCsrfTokens(except: [...])` に安易にルートを追加しないこと）。
 
 ## 3. Stateバケット作成
 
@@ -77,7 +98,7 @@ terraform apply -var 'git_repo_url=https://github.com/you/this-repo.git'
 terraform output alb_url
 ```
 
-EC2の初期プロビジョニング（`user_data`）が完了して `/up` が200を返すまで、ALBのターゲットグループは `unhealthy` のまま。**数分待ってから**、11章相当の受け入れ条件を [docs/trust-proxy.md](docs/trust-proxy.md) のcurlコマンドで確認する。
+EC2の初期プロビジョニング（`user_data`）が完了して `/up` が200を返すまで、ALBのターゲットグループは `unhealthy` のまま。**数分待ってから**、[docs/trust-proxy.md](docs/trust-proxy.md) のcurlコマンドで期待される挙動を確認する。
 
 ## 6. 検証の回し方
 
@@ -175,26 +196,15 @@ aws s3api delete-bucket --bucket <bucket-name> --region ap-northeast-1
 ## 9. トラブルシュート
 
 - **ターゲットグループが unhealthy のまま**: `user_data` によるプロビジョニングが完了していない可能性が高い（数分かかる）。SSMで入り `sudo tail -f /var/log/user-data.log` で進捗を確認する。
+  - ログが途中で止まっていて `/var/www/app` が存在しない場合、`user_data` スクリプトがエラーで異常終了している（`set -euo pipefail` により最初のエラーで即停止する）。原因を`infra/user_data.sh.tpl`側で修正した上で、**同じインスタンスをただ再起動しても直らない**点に注意（cloud-initは同じインスタンスIDに対して`user_data`を一度しか実行しない）。修正後は `terraform apply -replace=aws_instance.app -var 'git_repo_url=...'` でインスタンスを作り直す。
+  - `curl -i http://127.0.0.1/up` がEC2内で404を返す場合は、Apacheが `000-default` のままで自前のvhostに切り替わっていない＝`user_data`が9ステップ目まで到達していない証拠。
 - **`curl` で 400 が返る**: `TRUST_HOSTS` が設定されている状態で、リクエストの `Host` ヘッダがそのパターンにマッチしていない（意図した挙動。[docs/trust-proxy.md](docs/trust-proxy.md) 参照）。
 - **SSMで入れない**: EC2にアタッチされたインスタンスプロファイル（`AmazonSSMManagedInstanceCore`）と、SSM Agentが起動しているか（`systemctl status snap.amazon-ssm-agent.amazon-ssm-agent.service`）を確認する。22番ポートは意図的に開けていないためSSHでは入れない。
+- **`terraform apply` が `iam:CreateRole` で `AccessDenied`**: 「1. 前提ツール」の「IAM権限について」を参照。`PowerUserAccess` だけでは不足する。
 
-## PHPバージョンを8.5に変更する場合
+## 10. 最短ハンズオン手順（コマンドまとめ）
 
-`.mise.toml` の `php = "8.4"` と、`infra/user_data.sh.tpl` 内の `PHP_VERSION=8.4`（ondrej/php PPAパッケージ名に使われる）の**両方**を変更すること。片方だけ変更するとローカルとEC2でPHPバージョンがずれる。
-
-## リポジトリ構成
-
-```
-.
-├─ app/                # WhoAmIController, LogConnection
-├─ bootstrap/app.php    # trustProxies / trustHosts / CSRF除外 / ミドルウェア登録
-├─ routes/web.php       # GET/POST /whoami, /up はLaravel標準
-├─ infra/                # Terraform一式
-├─ scripts/              # bootstrap_state.sh, deploy.sh
-└─ docs/                 # architecture.md, trust-proxy.md, deploy.md
-```
-
-## 12. 生成後、人間が実行する順
+1〜9章を一通りやった後の振り返り用。上から順に実行すればインフラ構築から検証まで到達する。
 
 ```bash
 mise install
@@ -206,3 +216,21 @@ terraform apply -var 'git_repo_url=https://github.com/you/this-repo.git'
 terraform output alb_url
 # 数分待って /up が healthy になったら docs/trust-proxy.md のcurlで検証
 ```
+
+---
+
+## 付録: リポジトリ構成
+
+```
+.
+├─ app/                # WhoAmIController, LogConnection
+├─ bootstrap/app.php    # trustProxies / trustHosts / CSRF除外 / ミドルウェア登録
+├─ routes/web.php       # GET/POST /whoami, /up はLaravel標準
+├─ infra/                # Terraform一式
+├─ scripts/              # bootstrap_state.sh, deploy.sh
+└─ docs/                 # architecture.md, trust-proxy.md, deploy.md
+```
+
+## 付録: PHPバージョンを8.5に変更する場合
+
+`.mise.toml` の `php = "8.4"` と、`infra/user_data.sh.tpl` 内の `PHP_VERSION=8.4`（ondrej/php PPAパッケージ名に使われる）の**両方**を変更すること。片方だけ変更するとローカルとEC2でPHPバージョンがずれる。
