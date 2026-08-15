@@ -37,9 +37,11 @@ Laravelはデフォルトでは直接接続してきたピア（このリポジ�
 
 ## 検証コマンドと期待出力
 
-`ALB=$(terraform output -raw alb_url)` として、すべて `curl -k`（自己署名のため）。EC2/ALBを構築する前にローカルで挙動だけ確認したい場合は、`php artisan whoami:check` / `php artisan env:set` を使うと `php artisan serve` やcurlを使わずに同じ確認ができる（README「artisanコマンドでの確認」参照）。
+`ALB=$(terraform -chdir=infra output -raw alb_url)` として、すべて `curl -k`（自己署名のため）。EC2/ALBを構築する前にローカルで挙動だけ確認したい場合は、`php artisan whoami:check` / `php artisan env:set` を使うと `php artisan serve` やcurlを使わずに同じ確認ができる（README「artisanコマンドでの確認」参照）。
 
-### TrustProxies OFF（`.env`: `TRUST_PROXIES=none`）
+`.env` の書き換えはEC2側（SSMで入った先）、curlは手元のターミナルで実行する。手順の全体像・コピペ用コマンドはREADME「6. 検証の回し方」を参照。ここでは各状態での期待結果のみ示す。
+
+### TrustProxies OFF（`.env`: `TRUST_PROXIES=none`、初期値）
 ```bash
 curl -sk "$ALB/whoami" | jq
 ```
@@ -48,6 +50,13 @@ curl -sk "$ALB/whoami" | jq
 - `raw.X-Forwarded-Proto` = `https`（ALBは付けているが信頼していないため解決値には反映されない）
 
 ### TrustProxies ON（`.env`: `TRUST_PROXIES=all`、reload後）
+
+EC2側:
+```bash
+sudo sed -i 's/^TRUST_PROXIES=none/TRUST_PROXIES=all/' /var/www/app/.env
+sudo systemctl reload apache2
+```
+手元:
 ```bash
 curl -sk "$ALB/whoami" | jq
 ```
@@ -60,11 +69,18 @@ curl -sk -X POST "$ALB/whoami" | jq '.method'   # => "POST"（CSRFで419にな�
 ```
 
 ### TrustHosts（`.env`: `TRUST_HOSTS=^.*\.elb\.amazonaws\.com$`、reload後）
+
+EC2側:
+```bash
+sudo sed -i 's/^TRUST_HOSTS=.*/TRUST_HOSTS=^.*\\.elb\\.amazonaws\\.com$/' /var/www/app/.env
+sudo systemctl reload apache2
+```
+手元:
 ```bash
 curl -sk -o /dev/null -w "%{http_code}\n" "$ALB/whoami"                        # => 200
 curl -sk -o /dev/null -w "%{http_code}\n" "$ALB/whoami" -H "Host: evil.example" # => 400
 ```
-`TRUST_HOSTS=`（空）に戻すと両方 `200` になる。
+`TRUST_HOSTS=`（空、EC2側で `sudo sed -i 's/^TRUST_HOSTS=.*/TRUST_HOSTS=/' /var/www/app/.env` してreload）に戻すと両方 `200` になる。
 
 ## なぜ `config:cache` を使ってはいけないか
 

@@ -81,11 +81,68 @@ EC2の初期プロビジョニング（`user_data`）が完了して `/up` が20
 
 ## 6. 検証の回し方
 
-1. SSMでEC2に入る: `aws ssm start-session --target $(terraform -chdir=infra output -raw instance_id)`
-2. `/var/www/app/.env` の `TRUST_PROXIES` / `TRUST_HOSTS` を編集
-3. `sudo systemctl reload apache2`
+`.env` の編集は **EC2側**（SSMで入った先）、curlでの確認は **手元のターミナル**で行う。2箇所を行き来する点に注意。
+
+```
+[手元のターミナル] --curl(ALB経由)--> [EC2]
+        ↑                                ↑
+   結果を見る                    SSMで入って .env を編集
+```
 
 `config:cache` を実行していないため、`.env` の変更はApache reloadだけで即座に反映される（**`php artisan config:cache` は絶対に実行しないこと**。理由は [docs/trust-proxy.md](docs/trust-proxy.md)）。
+
+### TRUST_PROXIES=all を試す
+
+手元のターミナルで比較用に現状を記録しておく:
+```bash
+ALB=$(terraform -chdir=infra output -raw alb_url)
+curl -sk "$ALB/whoami" | jq '.resolved'   # 今は ip=ALB内部IP, is_secure=false のはず
+```
+
+SSMでEC2に入り、`.env` を書き換えてreload:
+```bash
+aws ssm start-session --target $(terraform -chdir=infra output -raw instance_id)
+```
+入った先（EC2側）で:
+```bash
+sudo sed -i 's/^TRUST_PROXIES=none/TRUST_PROXIES=all/' /var/www/app/.env
+sudo systemctl reload apache2
+exit
+```
+
+手元のターミナルに戻ってもう一度curl:
+```bash
+curl -sk "$ALB/whoami" | jq '.resolved'   # ip=自分のグローバルIP, is_secure=true, scheme=https に変わる
+```
+
+### TRUST_HOSTS を試す
+
+SSMで入って `.env` を編集:
+```bash
+aws ssm start-session --target $(terraform -chdir=infra output -raw instance_id)
+```
+```bash
+sudo sed -i 's/^TRUST_HOSTS=.*/TRUST_HOSTS=^.*\\.elb\\.amazonaws\\.com$/' /var/www/app/.env
+sudo systemctl reload apache2
+exit
+```
+
+手元のターミナルで確認:
+```bash
+curl -sk -o /dev/null -w "%{http_code}\n" "$ALB/whoami"                        # => 200（正当なHost）
+curl -sk -o /dev/null -w "%{http_code}\n" "$ALB/whoami" -H "Host: evil.example" # => 400（不正なHost）
+```
+
+### 既定値に戻す
+
+検証が終わったらSSMで入り直し、既定値に戻しておく:
+```bash
+sudo sed -i 's/^TRUST_PROXIES=all/TRUST_PROXIES=none/' /var/www/app/.env
+sudo sed -i 's/^TRUST_HOSTS=.*/TRUST_HOSTS=/' /var/www/app/.env
+sudo systemctl reload apache2
+```
+
+真理値表・全体像は [docs/trust-proxy.md](docs/trust-proxy.md) を参照。
 
 ## 7. 更新デプロイ
 
