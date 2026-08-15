@@ -4,6 +4,11 @@
 set -euo pipefail
 exec > >(tee -a /var/log/user-data.log) 2>&1
 
+# user_data はrootでHOME未設定のまま実行されるため、Composerが
+# "The HOME or COMPOSER_HOME environment variable must be set" で落ちるのを防ぐ。
+export HOME=/root
+export COMPOSER_HOME=/root/.composer
+
 GIT_REPO_URL="${git_repo_url}"
 GIT_BRANCH="${git_branch}"
 APP_DIR=/var/www/app
