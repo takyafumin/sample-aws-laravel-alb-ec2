@@ -15,6 +15,79 @@ ALBのような信頼できるロードバランサを経由したときだけ�
 
 この検証環境は、その「信じる／信じない」を切り替えたときに実際に何が起きるかを目で見て理解するためのものである。
 
+## この構成の物理配置と、TrustProxiesが実際に見ているもの
+
+### ALBは「マネージドなノード」＋「サブネット内の実ENI」のハイブリッド構成
+
+正確には、ALBは「VPCの中に構築される」のでも「VPCの外にあってENI経由で話しかけてくるだけ」のでもなく、**両方の性質を併せ持つ**（[AWS公式ドキュメント](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html)で確認）。
+
+- **ロードバランサーノード（実際の処理を行う実体）自体はAWSが完全管理するインフラ上で動作**しており、あなたのアカウント内にEC2のような「管理できるリソース」としては存在しない。
+- しかし、有効化した各サブネット（このリポジトリでは2つのパブリックサブネット、AZごとに1つ）には、AWSが**実際にENIを作成して配置**する。このENIは：
+  - そのサブネットのCIDRから**プライベートIPを1つ**受け取る（公式ドキュメント曰く "ENI reserved by ELB for subnet"。あなたのAWSアカウントのEC2コンソール→ネットワークインターフェースで実際に見える）
+  - インターネット向けALBの場合は、AWSのパブリックIPv4プールから**パブリックElastic IPも1つ**アタッチされる（`service_managed=ALB`としてアカウントに見えるが変更・解放は不可）
+
+つまり「ノードの計算処理」はAWS管理でブラックボックスだが、**そのノードがVPCと接続するための実体（ENI＋プライベートIP）は、文字通りあなたのサブネットの中に存在し、あなたのサブネットのIPアドレス空間を消費する**。だからこそEC2側で観測される`REMOTE_ADDR`は、必ずそのサブネットのCIDR内に収まる。
+
+```mermaid
+flowchart TB
+    client(("実クライアント<br/>（インターネット）"))
+
+    subgraph aws["AWSマネージドインフラ（ブラックボックス）"]
+        nodeA["ALBノードA<br/>（実処理）"]
+        nodeC["ALBノードC<br/>（実処理）"]
+    end
+
+    subgraph vpc["あなたのVPC 10.0.0.0/16"]
+        subgraph subnetA["public subnet A: 10.0.1.0/24"]
+            eniA["ENI（ALB用）<br/>プライベートIP: 10.0.1.x"]
+            ec2["EC2<br/>Apache + Laravel"]
+        end
+        subgraph subnetC["public subnet C: 10.0.2.0/24"]
+            eniC["ENI（ALB用）<br/>プライベートIP: 10.0.2.x"]
+        end
+    end
+
+    client -->|"① HTTPS:443<br/>自己署名証明書"| nodeA
+    client -->|"① HTTPS:443"| nodeC
+    nodeA -.->|"紐付け"| eniA
+    nodeC -.->|"紐付け"| eniC
+    eniA -->|"② HTTP:80（新規TCP接続）<br/>REMOTE_ADDR=10.0.1.x"| ec2
+    eniC -->|"② HTTP:80（新規TCP接続）<br/>REMOTE_ADDR=10.0.2.x"| ec2
+```
+
+EC2のSG（`infra/security.tf`）は「ALBのSGからのport 80のみ」を許可しているため、これ以外の経路でEC2の80番に到達することはできない。
+
+### ALBは client と EC2 の間で接続を「終端」する（L7プロキシ）
+
+ここが理解の核心。ALBはL7（HTTP）ロードバランサなので、**クライアント⇔ALBの接続と、ALB⇔EC2の接続は別物のTCP接続**になる。ALBはクライアントとの接続をここで一旦終端し、EC2へは新しく接続を張り直す。
+
+```mermaid
+sequenceDiagram
+    participant C as 実クライアント<br/>(グローバルIP例: 203.0.113.9)
+    participant ALB as ALBノード<br/>(10.0.x.x)
+    participant EC2 as EC2<br/>Apache/Laravel
+
+    C->>ALB: TCP接続#1 (HTTPS:443)
+    Note over C,ALB: ALB視点のREMOTE_ADDR = 203.0.113.9
+
+    ALB->>EC2: TCP接続#2（新規） (HTTP:80)
+    Note over ALB,EC2: EC2視点のREMOTE_ADDR = ALBノードのIP (10.0.x.x)<br/>ヘッダ X-Forwarded-For: 203.0.113.9 を付与
+
+    EC2-->>ALB: レスポンス
+    ALB-->>C: レスポンス
+```
+
+そのためEC2/Laravel側から見ると、`REMOTE_ADDR`（＝サーバーに直接TCP接続してきた相手のIP）は**常にALBノードのIP**であり、実クライアントのIPはどこにも直接は現れない。実クライアントのIPを知る唯一の手段が、ALBが付与する `X-Forwarded-For` ヘッダというわけである。
+
+（実際の検証でも `REMOTE_ADDR: "10.0.2.73"` が観測された。これはまさに `10.0.2.0/24` サブネットに属するALBノードのIPである。）
+
+### TrustProxiesが判定に使っているのは「接続元」であって「接続先」ではない
+
+TrustProxiesの処理は次の2段階。**見ているのは常に「接続元」（＝今このリクエストを直接送ってきたのは誰か）であり、「接続先」（このEC2自身のIPやポート）は一切関係ない。**
+
+1. 「今つながってきた `REMOTE_ADDR` は、`TRUST_PROXIES` に設定した信頼リストに含まれるか？」を判定する。リクエストの中身やヘッダの値はここでは見ない。純粋に「直接接続してきた相手のIP（＝接続元）」と設定値を突き合わせるだけ。
+2. 1でYESだった場合に**限り**、そのリクエストに付いている `X-Forwarded-For` / `X-Forwarded-Proto` 等ヘッダの**値**を信用し、`ip()` / `isSecure()` / `getScheme()` の返り値をそちらに差し替える。NOなら、ヘッダは黙って無視され、`REMOTE_ADDR` と実際の接続プロトコル（EC2からは常にHTTP）がそのまま使われる。
+
 ## TrustProxies が変えるもの
 
 Laravelはデフォルトでは直接接続してきたピア（このリポジトリでは常にALBの内部IP）だけを信頼する。ALBやCDNなどのリバースプロキシ経由でアクセスされる環境では、クライアントが送ってきた（あるいはプロキシが付与した）`X-Forwarded-For` / `X-Forwarded-Proto` / `X-Forwarded-Host` / `X-Forwarded-Port` ヘッダを信頼するかどうかを `bootstrap/app.php` の `trustProxies()` で明示的に設定する必要がある。
@@ -42,7 +115,7 @@ X-Forwarded-For: 203.0.113.1
 
 のようなヘッダを自分で付けて送るだけで、`ip()` の戻り値を偽装し、この制限を突破できてしまう。同様に、アクセスログやレート制限も `ip()` を元にしていることが多く、偽装できれば「誰の操作か分からなくする（ログ改ざん）」「1つのIPからの大量アクセスをまるで多数のユーザーからのアクセスに見せかけてレート制限を回避する」といった悪用が可能になる。
 
-> **⚠️ この検証環境の `TRUST_PROXIES=all`（`at: '*'`）は、挙動を分かりやすく見せるためにあえて「全プロキシを信頼」する設定にしている。実際のプロダクション環境でこれをそのまま使ってはいけない。** `at: '*'` は「直接つながってきた相手（＝REMOTE_ADDR）を信頼する」という意味になるため、もしEC2に直接アクセスできる経路が万一開いてしまえば（SG設定ミス等）、そのままヘッダ偽装が成立してしまう。本番では `at:` に**実際のロードバランサのIP/CIDRだけ**を明示的に指定するのが正しい使い方（このリポジトリでいえば `TRUST_PROXIES=10.0.0.0/16` のようにVPC内のCIDRへ絞る、が実運用に近い設定）。
+> **⚠️ この検証環境の `TRUST_PROXIES=all`（`at: '*'`）は、挙動を分かりやすく見せるためにあえて「全プロキシを信頼」する設定にしている。実際のプロダクション環境でこれをそのまま使ってはいけない。** `at: '*'` は「直接つながってきた相手（＝REMOTE_ADDR）を信頼する」という意味になるため、もしEC2に直接アクセスできる経路が万一開いてしまえば（SG設定ミス等）、そのままヘッダ偽装が成立してしまう。本番でどう設定すべきかは末尾の「[この構成における「あるべき」設定（べき論）](#この構成におけるあるべき設定べき論)」を参照。
 
 ## TrustHosts が変えるもの
 
@@ -53,6 +126,14 @@ X-Forwarded-For: 203.0.113.1
 > **補足（正確性のため）**: 一般にLaravelの `TrustHosts` は、`TrustProxies` 側で `X-Forwarded-Host` を信頼する設定（`HEADER_X_FORWARDED_HOST` ビット）になっていれば、そのヘッダも判定対象にする。しかし本リポジトリの `bootstrap/app.php` が使う `Request::HEADER_X_FORWARDED_AWS_ELB` はこのビットを**含んでいない**ため、`TrustHosts` は常に生の `Host` ヘッダだけを見る。
 >
 > **補足（ハマりどころ）**: `TrustHosts` は `APP_ENV=local` のときはLaravel側で自動的にスキップされる（`shouldSpecifyTrustedHosts()`）。ローカルで `TRUST_HOSTS` を試すときに「設定したのに400にならない」と思ったら、まず `.env` の `APP_ENV` を確認すること。本リポジトリの既定値は `APP_ENV=production` なので、ローカルでも通常は問題なく動く。
+>
+> **⚠️ 補足（実際に発生した事故①: ヘルスチェックが400で弾かれる）**: `TRUST_HOSTS` をALBのDNS名（`^.*\.elb\.amazonaws\.com$` 等）だけに絞ったまま放置すると、**ALB自身のヘルスチェックまで400で弾かれ、ターゲットグループがunhealthyになる**。実機で`public/`に一時的なデバッグ用PHPファイルを置いて`$_SERVER['HTTP_HOST']`を直接観測したところ、ALBのヘルスチェックリクエスト（`User-Agent: ELB-HealthChecker/2.0`）の`Host`ヘッダは**ターゲット（EC2）自身のプライベートIP**（例: `10.0.1.31`、ポート番号は付かない）であることを確認した。ALBのDNS名にしかマッチしないパターンではこれが弾かれてしまう。
+>
+> **⚠️ 補足（実際に発生した事故②: 正規表現の書き方でLaravelごと500クラッシュする）**: 上記対策として `TRUST_HOSTS=...,^10\.0\.[12]\.[0-9]{1,3}(:[0-9]+)?$` のように**量指定子 `{1,3}`（中括弧）を含むパターン**を設定したところ、400ではなく **500 Internal Server Error** になった。原因はSymfonyの `Request::setTrustedHosts()` が各パターンを内部で `{パターン}i` という**中括弧そのものをデリミタとして**囲む実装になっているため（`vendor/symfony/http-foundation/Request.php`）、パターン中の `{1,3}` がデリミタ用の中括弧と衝突し `preg_match(): No ending matching delimiter '}' found` で例外が発生していた。**`TRUST_HOSTS` の正規表現では `{n,m}` 形式の量指定子を避け、`[0-9]+` のように書くこと。**
+>
+> 対策まとめ:
+> 1. `/up` のヘルスチェック確認が終わったら**必ず `TRUST_HOSTS` を検証前の値に戻す**。
+> 2. 本番相当の値にする場合は、ALBのDNS名に加えて**ターゲットが属するサブネットのプライベートIP帯**にマッチするパターンも含める（例: `^10\.0\.[12]\.[0-9]+$`）。**中括弧`{}`を使う量指定子は避ける。**
 
 ### なぜHostヘッダの検証が必要なのか（具体例）
 
@@ -130,3 +211,35 @@ curl -sk -o /dev/null -w "%{http_code}\n" "$ALB/whoami" -H "Host: evil.example" 
 ## `bootstrap/app.php` で `.env` を明示的に読み込んでいる理由
 
 `withMiddleware()` に渡したコールバックは、HTTPカーネル（`HttpKernel::class`）がコンテナから解決されたタイミングで実行される。これは `LoadEnvironmentVariables` ブートストラッパー（`.env` を実際に読み込む処理）より**前**に発生するため、対策をしないとコールバック内の `env('TRUST_PROXIES')` / `env('TRUST_HOSTS')` は常に `.env` の内容を無視してデフォルト値（`none` / 空文字）を返してしまう（実機検証で確認済みの挙動）。これを避けるため `bootstrap/app.php` の冒頭で `Dotenv\Dotenv::createImmutable(...)->safeLoad()` を呼び、`.env` を先に読み込んでいる。後続の通常のブートストラップ処理（`LoadEnvironmentVariables`）は `createImmutable`（既存値を上書きしない）のため二重読み込みしても副作用はない。
+
+## この構成における「あるべき」設定（べき論）
+
+ここまでの `TRUST_PROXIES=none/all`、`TRUST_HOSTS=空/*.elb.amazonaws.com` という値は、**挙動の違いを分かりやすく見せるための教材用の値**であり、「これが推奨設定」という意味ではない。実際にこの構成（ALB 1台 + EC2 1台、独自ドメインなし）を運用するなら、以下が正しい設定になる。
+
+| 項目 | 教材でのデモ値 | この構成での推奨値 |
+|---|---|---|
+| `TRUST_PROXIES` | `none` / `all` | `10.0.1.0/24,10.0.2.0/24`（ALBが乗っているパブリックサブネットのCIDR＝`var.public_subnet_cidrs`） |
+| `TRUST_HOSTS` | 空 / `^.*\.elb\.amazonaws\.com$` | ①このALB自身のDNS名 **と** ②ターゲット自身のプライベートIP帯（ヘルスチェック用）の両方にマッチする正規表現 |
+
+### TRUST_PROXIES: `none`でも`all`でもなく、ALBのサブネットCIDRに絞る
+
+- **`none`は不可**: ALB経由であることをアプリが一切認識できず、`isSecure()`が常にfalseになる等、実用にならない。
+- **`all`（`at:'*'`）は「今のSG設定に守られているから結果的に事故らないだけ」**: `infra/security.tf` のSGが「ALBのSGからのport 80のみ」を強制しているので、`all`でも今は実害が出ない。しかしこれは **ネットワーク層（SG）の防御に、アプリ層の設定がただ乗りしているだけ**の状態であり、アプリ層自体は何も守っていない。将来SGを緩めたり、EC2を別用途に転用したりした瞬間、ヘッダ偽装が即座に成立してしまう。ネットワーク層とアプリ層それぞれで独立に境界を表現しておく（多層防御）のが正しい設計。
+- ALBの各ノードの個別IPはAWSのスケーリングに応じて変わりうるため現実的に運用できないが、**ALBが必ず存在するサブネットのCIDR**は変わらない。したがって `TRUST_PROXIES=10.0.1.0/24,10.0.2.0/24`（より簡便には `10.0.0.0/16` のVPC全体でも可）が、動的なALBに対する現実的かつ正確な絞り方になる。
+
+### TRUST_HOSTS: `*.elb.amazonaws.com`ではなく、このALB固有のDNS名 **＋ ヘルスチェック用のパターン** に絞る
+
+教材内で使っている `^.*\.elb\.amazonaws\.com$` は、**AWSの他のアカウント・他人のALBのDNS名も全部マッチしてしまう**ため緩すぎる。正しくは、実際にデプロイされたこのALB自身のDNS名（`terraform output -raw alb_dns_name`）だけにピンポイントで一致させたい。
+
+ただし、**ALB自身のDNS名だけに絞ると、今度はALBのヘルスチェックが弾かれてターゲットグループがunhealthyになる**（前節の「実際に発生した事故①」を参照）。実機で観測したところ、ALBのヘルスチェックリクエストの`Host`ヘッダは、ALBのDNS名ではなく**ターゲット（EC2）自身のプライベートIP**（例: `10.0.1.31`、ポート番号なし）になる。したがって、実際に安全かつ壊れない設定にするには、**この2パターンをカンマ区切りで両方許可する**必要がある。
+
+```
+TRUST_HOSTS=^trust-verify-alb-1943783953\.ap-northeast-1\.elb\.amazonaws\.com$,^10\.0\.[12]\.[0-9]+$
+```
+
+- 1つ目: このALB自身のDNS名（実クライアントからの正規リクエスト用）
+- 2つ目: `10.0.1.x` / `10.0.2.x`（＝EC2が起動しうるパブリックサブネットのCIDR、`var.public_subnet_cidrs`と対応）へのIP形式（ALBのヘルスチェック用。ターゲットが複数台・複数AZになる場合を見越してサブネット単位のCIDRで表現している）
+
+**`[0-9]{1,3}` のように中括弧`{}`を使う量指定子は書かないこと**（前節の「実際に発生した事故②」参照。Symfonyがパターン全体を`{...}i`で囲むため、パターン内の中括弧と衝突してLaravelごと500エラーになる）。個別のALBノードIPやターゲットIPは動的に変わりうるため、`TRUST_PROXIES`のときと同様に「対象が必ず存在するサブネットのCIDRを表す正規表現」で表現するのが現実的かつ正確な絞り方になる。
+
+理想は、1つ目のALB DNS名を手打ちせず **Terraformの `aws_lb.main.dns_name` から自動的に注入する**ことで、手打ちミスによる齟齬をなくすこと（例えば `infra/ec2.tf` の `templatefile()` に `alb_dns_name` も渡し、`user_data.sh.tpl` 側で `.env` に書き込む）。本リポジトリの既定構成にはまだ含めていない。

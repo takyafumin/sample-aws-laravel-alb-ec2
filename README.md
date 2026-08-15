@@ -198,7 +198,9 @@ aws s3api delete-bucket --bucket <bucket-name> --region ap-northeast-1
 - **ターゲットグループが unhealthy のまま**: `user_data` によるプロビジョニングが完了していない可能性が高い（数分かかる）。SSMで入り `sudo tail -f /var/log/user-data.log` で進捗を確認する。
   - ログが途中で止まっていて `/var/www/app` が存在しない場合、`user_data` スクリプトがエラーで異常終了している（`set -euo pipefail` により最初のエラーで即停止する）。原因を`infra/user_data.sh.tpl`側で修正した上で、**同じインスタンスをただ再起動しても直らない**点に注意（cloud-initは同じインスタンスIDに対して`user_data`を一度しか実行しない）。修正後は `terraform apply -replace=aws_instance.app -var 'git_repo_url=...'` でインスタンスを作り直す。
   - `curl -i http://127.0.0.1/up` がEC2内で404を返す場合は、Apacheが `000-default` のままで自前のvhostに切り替わっていない＝`user_data`が9ステップ目まで到達していない証拠。
-- **`curl` で 400 が返る**: `TRUST_HOSTS` が設定されている状態で、リクエストの `Host` ヘッダがそのパターンにマッチしていない（意図した挙動。[docs/trust-proxy.md](docs/trust-proxy.md) 参照）。
+  - **`/var/log/apache2/trust-verify-access.log` に `"GET /up ..." 400 ... "ELB-HealthChecker/2.0"` が並んでいる場合**: `TRUST_HOSTS` をALBのDNS名だけに絞ったまま戻し忘れている。ALBのヘルスチェックはALBのDNS名ではなくターゲットのプライベートIPを`Host`ヘッダに使うため、DNS名限定のパターンだとヘルスチェック自体が400で弾かれる。`sudo sed -i 's/^TRUST_HOSTS=.*/TRUST_HOSTS=/' /var/www/app/.env && sudo systemctl reload apache2` で復旧する（詳細は[docs/trust-proxy.md](docs/trust-proxy.md)）。
+  - **`/up`が`500`を返し、`storage/logs/laravel.log`に`preg_match(): No ending matching delimiter '}' found`が出ている場合**: `TRUST_HOSTS`の正規表現に`[0-9]{1,3}`のような中括弧`{}`を使う量指定子を書いている。Symfonyがパターン全体を`{...}i`で囲む実装のため中括弧が衝突しクラッシュする。`[0-9]+`のように書き換える（詳細は[docs/trust-proxy.md](docs/trust-proxy.md)）。
+- **`curl` で 400 が返る**: `TRUST_HOSTS` が設定されている状態で、リクエストの `Host` ヘッダがそのパターンにマッチしていない（意図した挙動。[docs/trust-proxy.md](docs/trust-proxy.md) 参照）。ただし`/up`のヘルスチェック自体が400になっている場合は上記の「ターゲットグループがunhealthyのまま」を参照。
 - **SSMで入れない**: EC2にアタッチされたインスタンスプロファイル（`AmazonSSMManagedInstanceCore`）と、SSM Agentが起動しているか（`systemctl status snap.amazon-ssm-agent.amazon-ssm-agent.service`）を確認する。22番ポートは意図的に開けていないためSSHでは入れない。
 - **`terraform apply` が `iam:CreateRole` で `AccessDenied`**: 「1. 前提ツール」の「IAM権限について」を参照。`PowerUserAccess` だけでは不足する。
 
